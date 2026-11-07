@@ -2,3 +2,16 @@
 /OneCovariance
 __pycache__/
 .ipynb_checkpoints/
+
+# Generierte Daten, Modelle und MCMC-Ergebnisse bleiben lokal.
+/Footprint/Overlap/*.npz
+/G2L/onecov_run/output/
+/Modelling/NN_GM/
+/Modelling/gm_emulator.npz
+/Modelling/theory_results.npz
+/Modelling/Compare/ggl_measurements.npz
+/Modelling/Compare/*_result.ipynb
+/Modelling/chain*.npz
+/Modelling/mcmc*.log
+/Modelling/backup_nb/
+/plots.png

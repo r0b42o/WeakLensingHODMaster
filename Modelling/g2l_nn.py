@@ -44,8 +44,8 @@ except AttributeError:
 # ---------------------------------------------------------------------------
 COSMO_NAMES = ["Om_c", "Om_b", "h", "sigma_8", "n_s"]
 HOD_NAMES = ["alpha", "sigma", "log10_Mth", "log10_Mprime", "beta"]
-PRIOR_COSMO = {"Om_c": (0.1, 0.6), "Om_b": (0.04, 0.06), "h": (0.64, 0.82),
-               "sigma_8": (0.6, 1.0), "n_s": (0.84, 1.1)}
+PRIOR_COSMO = {"Om_c": (0.1, 0.5), "Om_b": (0.03, 0.07), "h": (0.55, 0.85),
+               "sigma_8": (0.4, 1.2), "n_s": (0.8, 1.2)}
 # Massen: flach in log10(M) ueber das Trainingsintervall (Mth 1e10-1e15, Mprime 1e10-1e17)
 PRIOR_HOD = {"alpha": (0.0, 1.0), "sigma": (0.01, 1.0), "log10_Mth": (10.0, 15.0),
              "log10_Mprime": (10.0, 17.0), "beta": (0.1, 2.0)}
@@ -200,13 +200,12 @@ class G2LTheory:
 
     def __init__(self, combos, thetas_arcmin, zs, n_lenses, n_sources, emulator=None,
                  ell_range=(0.5, 3e6), n_ell_coarse=110, n_ell_fine=12000, dz_lens=0.004,
-                 taper=100.0, growth_scaling=True, n_z_nodes=8):
+                 taper=100.0, growth_scaling=True):
         self.combos = list(combos)
         self.lens_names = list(dict.fromkeys(l for l, _ in self.combos))
         self.emu = emulator if emulator is not None else GMEmulator()
         self.zs, self.n_lenses, self.n_sources = zs, n_lenses, n_sources
         self.growth_scaling = growth_scaling
-        self.n_z_nodes = n_z_nodes
 
         # z-Gitter der Lens-Integration (nur dort, wo n_l(z) nennenswert ist)
         zmax_l = max(zs[np.where(n > 1e-4 * n.max())[0][-1]] for n in n_lenses.values()) + 0.05
@@ -217,14 +216,14 @@ class G2LTheory:
         self.w_l[-1] *= 0.5
         self.nl_z = {l: np.interp(self.z_l, zs, n_lenses[l]) for l in self.lens_names}
 
-        # z-Stuetzstellen des NN je Lens-Bin: nur dort, wo n_l(z) relevant ist (ln P wird dazwischen kubisch interpoliert)
-        self.z_nodes = {}
-        z_max_nn = self.emu.z_range[1] if self.emu.has_z else np.inf
-        for l in self.lens_names:
-            sig = np.where(n_lenses[l] > 1e-4 * n_lenses[l].max())[0]
-            lo = max(zs[sig[0]] - 0.02, self.emu.z_range[0] if self.emu.has_z else 0.0)
-            hi = min(zs[sig[-1]] + 0.02, z_max_nn)
-            self.z_nodes[l] = np.linspace(lo, hi, n_z_nodes)
+        # Nur Gitterpunkte mit nichtverschwindendem Lens-Gewicht tragen zum Integral bei.
+        self.z_indices = {l: np.flatnonzero(self.nl_z[l] != 0) for l in self.lens_names}
+        if self.emu.has_z:
+            for l, indices in self.z_indices.items():
+                z = self.z_l[indices]
+                if z.size and (z.min() < self.emu.z_range[0] or z.max() > self.emu.z_range[1]):
+                    raise ValueError(f"{l}: Lens-z-Gitter ausserhalb des NN-Trainingsbereichs "
+                                     f"{self.emu.z_range}: [{z.min():.4g}, {z.max():.4g}]")
 
         # ell-Gitter und Hankel-Kern gamma_t = int dln(ell) ell^2 C(ell) J_2(ell theta) / (2 pi).
         # Der Integrand oszilliert fuer ell*theta >> 1; die glatte Daempfung exp(-(ell*theta/taper)^2)
@@ -278,10 +277,10 @@ class G2LTheory:
         ln_p = _interp_extrap(lnk, self.emu.lnk, ln_pk0)
         return np.exp(ln_p) * bg["D2"][:, None]
 
-    def nn_nodes(self, cosmo_vals, hod_vals):
-        """Ein gemeinsamer NN-Vorwaertslauf fuer alle Lens-Bins und z-Knoten: dict {lens: ln P_total (n_nodes, 50)}."""
-        rows = [np.column_stack([np.tile(np.concatenate([cosmo_vals, hod_vals[i]]), (self.z_nodes[l].size, 1)),
-                                 self.z_nodes[l]]) for i, l in enumerate(self.lens_names)]
+    def nn_grid(self, cosmo_vals, hod_vals):
+        """NN-Auswertung fuer jedes beitragende Lens-z, gebuendelt ueber alle Lens-Bins."""
+        rows = [np.column_stack([np.tile(np.concatenate([cosmo_vals, hod_vals[i]]), (len(self.z_indices[l]), 1)),
+                                 self.z_l[self.z_indices[l]]]) for i, l in enumerate(self.lens_names)]
         ln_pk = self.emu.ln_pk(np.vstack(rows))[:, 2, :]
         out, pos = {}, 0
         for l, r in zip(self.lens_names, rows):
@@ -290,17 +289,14 @@ class G2LTheory:
         return out
 
     def pk_matrix_z(self, lens, ln_pk, bg):
-        """Variante B: P_gm(ell / chi(z), z) auf dem (z_l, ell_coarse)-Gitter fuer einen Lens-Bin aus ln_pk = nn_nodes()[lens].
-
-        Das NN wird nur an `n_z_nodes` Rotverschiebungen ausgewertet; ln P wird bei festem ell
-        kubisch in z auf das feine z-Gitter interpoliert (ausserhalb des Knotenbereichs konstant fortgesetzt)."""
-        zn = self.z_nodes[lens]
-        chi_n = np.interp(zn, self.zs, bg["chi"])
-        ln_p_nodes = np.empty((zn.size, self.ell_c.size))
-        for j in range(zn.size):
-            ln_p_nodes[j] = _interp_extrap(np.log(self.ell_c / chi_n[j]), self.emu.lnk, ln_pk[j])
-        z_eval = np.clip(self.z_l, zn[0], zn[-1])
-        return np.exp(CubicSpline(zn, ln_p_nodes, axis=0)(z_eval))
+        """P_gm(ell / chi(z), z) direkt auf dem Lens-Integrationsgitter."""
+        indices = self.z_indices[lens]
+        if len(ln_pk) != len(indices):
+            raise ValueError(f"{lens}: Anzahl NN-Ausgaben passt nicht zum Lens-z-Gitter")
+        pmat = np.zeros((self.z_l.size, self.ell_c.size))
+        for i, ln_p in zip(indices, ln_pk):
+            pmat[i] = np.exp(_interp_extrap(np.log(self.ell_c / bg["chi_l"][i]), self.emu.lnk, ln_p))
+        return pmat
 
     def c_kg(self, pmat, bg, lens, src):
         weight = self.w_l * self.nl_z[lens] * self.lensing_kernel(bg, src) / bg["chi_l"]
@@ -321,8 +317,8 @@ class G2LTheory:
         if pmats is None:
             hod_vals = np.asarray(hod_vals)
             if self.emu.has_z:
-                nodes = self.nn_nodes(np.asarray(cosmo_vals), hod_vals)
-                pmats = {l: self.pk_matrix_z(l, nodes[l], bg) for l in self.lens_names}
+                grid = self.nn_grid(np.asarray(cosmo_vals), hod_vals)
+                pmats = {l: self.pk_matrix_z(l, grid[l], bg) for l in self.lens_names}
             else:
                 feats = np.hstack([np.tile(cosmo_vals, (len(self.lens_names), 1)), hod_vals])
                 ln_pk0 = self.emu.ln_pk(feats)[:, 2, :]

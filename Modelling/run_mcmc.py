@@ -4,7 +4,7 @@ Aufruf (Env MA):
     python run_mcmc.py --out chain_A.npz --nwalkers 96 --nsteps 3000 --nproc 16
 Fortsetzen: gleicher Befehl, vorhandene --out wird weitergefuehrt.
 """
-import argparse, os, sys, time
+import argparse, os, sys, tempfile, time
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 import numpy as np
@@ -55,6 +55,27 @@ def init_walkers():
     return np.clip(p0, space.lo + 1e-9, space.hi - 1e-9)
 
 
+def save_checkpoint(path, chain, lnp):
+    directory = os.path.dirname(os.path.abspath(path))
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".mcmc-", suffix=".npz",
+                                     delete=False) as tmp:
+        temp_path = tmp.name
+        try:
+            np.savez(tmp, chain=chain, lnprob=lnp, names=np.array(space.names),
+                     labels=np.array(space.labels), lo=space.lo, hi=space.hi,
+                     combos=np.array([f"{a}|{b}" for a, b in data.combos]))
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except BaseException:
+            os.unlink(temp_path)
+            raise
+    try:
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def main():
     done = 0
     chain = np.zeros((0, args.nwalkers, nd))
@@ -80,9 +101,7 @@ def main():
             lnp = np.concatenate([lnp, sampler.get_log_prob()])
             sampler.reset()
             done += n
-            np.savez(args.out, chain=chain, lnprob=lnp, names=np.array(space.names),
-                     labels=np.array(space.labels), lo=space.lo, hi=space.hi,
-                     combos=np.array([f"{a}|{b}" for a, b in data.combos]))
+            save_checkpoint(args.out, chain, lnp)
             best = lnp.max()
             print(f"Schritt {done}/{args.nsteps}  max lnP={best:.1f}  "
                   f"{(time.time()-t0)/(n and 1):.0f}s seit Start", flush=True)
